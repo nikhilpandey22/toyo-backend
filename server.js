@@ -294,7 +294,7 @@ app.get("/api/settings", async (req, res) => {
 });
 app.get('/api/data', async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM temperatures ORDER BY id DESC LIMIT 100');
+    const result = await pool.query('SELECT * FROM production_log ORDER BY id DESC LIMIT 100');
     res.json({ data: result.rows });
   } catch (err) {
     console.error(err);
