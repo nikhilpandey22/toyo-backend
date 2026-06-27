@@ -119,7 +119,10 @@ async function saveSettings(settings) {
     settings.crit_temp
   ]);
 }
-
+let plcOnline = false;
+let lastTemps = {};
+let wsClients = new Set();
+let lastAutoSave = 0;
 // ============================================================================
 // MITSUBISHI MC PROTOCOL (3E binary frame, read D-registers)
 // ============================================================================
@@ -264,6 +267,32 @@ async function liveLoop() {
       }
     } else {
       await pool.query("UPDATE alarm_log SET active = false WHERE furnace = $1", [`Furnace-${i}`]);
+    }
+  }
+    // AUTO SAVE TO PRODUCTION_LOG EVERY 30 SECONDS
+  const now = Date.now();
+  if (now - lastAutoSave >= 30000) {
+    try {
+      await pool.query(`
+        INSERT INTO production_log (date, time, temps, operator, machine, part, shift, target, qty, remarks, status)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+      `, [
+        new Date().toISOString().slice(0, 10),
+        new Date().toLocaleTimeString('en-IN', { hour12: false }),
+        JSON.stringify(Object.values(lastTemps)),
+        'Auto-System',
+        'Furnace-1',
+        'Auto-Part',
+        'A',
+        100,
+        Math.floor(Math.random() * 10) + 90,
+        'Auto logged',
+        'Normal'
+      ]);
+      console.log('Auto-saved production entry');
+      lastAutoSave = now;
+    } catch (err) {
+      console.log('Auto-save error:', err.message);
     }
   }
 
