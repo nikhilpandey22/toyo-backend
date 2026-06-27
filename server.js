@@ -1,66 +1,124 @@
 /* =============================================================================
    TOYO SPRINGS LTD — FURNACE MES BACKEND
-   Plain Node.js (Express + ws). No native build tools needed.
-   - Serves the HTML/CSS/JS frontend from /public
-   - Stores users / settings / production log / alarms in a simple JSON file (db.json)
-   - Talks to a Mitsubishi PLC using the MC Protocol (3E binary frame) over TCP,
-     OR runs SIMULATION MODE automatically if no PLC is reachable.
-   - Pushes live furnace temperatures to the browser every second via WebSocket.
+   PostgreSQL Version - Render Deployment
    ========================================================================== */
-
+const pool = require('./db.js');
 const express = require("express");
 const http = require("http");
 const net = require("net");
 const crypto = require("crypto");
-const fs = require("fs");
 const path = require("path");
 const { WebSocketServer } = require("ws");
+const pool = require("./db");
+require("dotenv").config();
 
 const APP_DIR = __dirname;
-const DB_FILE = path.join(APP_DIR, "db.json");
 
-// ---------------------------------------------------------------- JSON "DB" --
-function defaultDB() {
-  return {
-    users: [
-      { username: "admin", password: sha256("toyo@123"), role: "Admin", full_name: "Administrator" },
-      { username: "operator", password: sha256("oper@123"), role: "Operator", full_name: "Line Operator" },
-    ],
-    settings: {
-      furnace_count: 6,
-      plc_ip: "192.168.3.39",
-      plc_port: 5007,
-      simulation_mode: true,   // set to false once a real PLC is reachable
-      warn_temp: 850,
-      crit_temp: 950,
-    },
-    production_log: [],   // {id,date,time,temps:[..],operator,machine,part,shift,target,qty,remarks,status}
-    alarm_log: [],        // {id,ts,furnace,level,message}
-  };
-}
-
+// ---------------------------------------------------------------- UTILS --
 function sha256(s) {
   return crypto.createHash("sha256").update(s).digest("hex");
 }
 
-function loadDB() {
-  if (!fs.existsSync(DB_FILE)) {
-    fs.writeFileSync(DB_FILE, JSON.stringify(defaultDB(), null, 2));
+// ---------------------------------------------------------------- DB INIT --
+async function initDB() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        username VARCHAR(50) UNIQUE NOT NULL,
+        password VARCHAR(100) NOT NULL,
+        role VARCHAR(20) NOT NULL,
+        full_name VARCHAR(100)
+      );
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS settings (
+        id INT PRIMARY KEY DEFAULT 1,
+        furnace_count INT DEFAULT 6,
+        plc_ip VARCHAR(50) DEFAULT '192.168.3.39',
+        plc_port INT DEFAULT 5007,
+        simulation_mode BOOLEAN DEFAULT true,
+        warn_temp INT DEFAULT 850,
+        crit_temp INT DEFAULT 950
+      );
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS production_log (
+        id SERIAL PRIMARY KEY,
+        date DATE NOT NULL,
+        time VARCHAR(20) NOT NULL,
+        temps JSONB,
+        operator VARCHAR(100),
+        machine VARCHAR(50),
+        part VARCHAR(100),
+        shift VARCHAR(20),
+        target INT,
+        qty INT,
+        remarks TEXT,
+        status VARCHAR(20)
+      );
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS alarm_log (
+        id SERIAL PRIMARY KEY,
+        ts VARCHAR(50) NOT NULL,
+        furnace VARCHAR(50) NOT NULL,
+        level VARCHAR(20) NOT NULL,
+        message TEXT NOT NULL,
+        active BOOLEAN DEFAULT true
+      );
+    `);
+
+    // Insert default admin/operator if not exists
+    await pool.query(`
+      INSERT INTO users (username, password, role, full_name)
+      VALUES
+        ('admin', $1, 'Admin', 'Administrator'),
+        ('operator', $2, 'Operator', 'Line Operator')
+      ON CONFLICT (username) DO NOTHING
+    `, [sha256("toyo@123"), sha256("oper@123")]);
+
+    // Insert default settings if not exists
+    await pool.query(`
+      INSERT INTO settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING
+    `);
+
+    console.log("PostgreSQL tables ready ✅");
+  } catch (err) {
+    console.error("DB Init Error:", err);
   }
-  return JSON.parse(fs.readFileSync(DB_FILE, "utf-8"));
 }
 
-function saveDB(db) {
-  fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
+async function getSettings() {
+  const result = await pool.query("SELECT * FROM settings WHERE id = 1");
+  return result.rows[0];
 }
 
-let db = loadDB();
+async function saveSettings(settings) {
+  await pool.query(`
+    UPDATE settings SET
+      furnace_count = $1,
+      plc_ip = $2,
+      plc_port = $3,
+      simulation_mode = $4,
+      warn_temp = $5,
+      crit_temp = $6
+    WHERE id = 1
+  `, [
+    settings.furnace_count,
+    settings.plc_ip,
+    settings.plc_port,
+    settings.simulation_mode,
+    settings.warn_temp,
+    settings.crit_temp
+  ]);
+}
 
 // ============================================================================
-//  MITSUBISHI MC PROTOCOL  (3E binary frame, read D-registers)
-//  Minimal client implemented directly over TCP — no extra npm dependency.
-//  Works with Mitsubishi Q / L / iQ-R series Ethernet ports configured for
-//  "MC Protocol (Binary)" with the 3E frame.
+// MITSUBISHI MC PROTOCOL (3E binary frame, read D-registers)
 // ============================================================================
 function mcRead3E({ host, port, headDevice = "D100", count = 6, timeout = 1500 }) {
   return new Promise((resolve, reject) => {
@@ -78,22 +136,21 @@ function mcRead3E({ host, port, headDevice = "D100", count = 6, timeout = 1500 }
     socket.on("error", (e) => fail(e));
 
     socket.connect(port, host, () => {
-      // Build 3E binary frame: read "count" words from device "D" starting at headDevice number
       const devNum = parseInt(headDevice.replace(/[^0-9]/g, ""), 10);
       const frame = Buffer.alloc(21);
       let o = 0;
-      frame.writeUInt16LE(0x50, o); o += 2;      // Subheader 0x5000
-      frame.writeUInt8(0x00, o); o += 1;         // Network No
-      frame.writeUInt8(0xff, o); o += 1;         // PC No
-      frame.writeUInt16LE(0x03ff, o); o += 2;    // Request dest module I/O
-      frame.writeUInt8(0x00, o); o += 1;         // Request dest module station No
-      frame.writeUInt16LE(0x0c, o); o += 2;      // Request data length (fixed for read command)
-      frame.writeUInt16LE(0x0010, o); o += 2;    // CPU monitoring timer
-      frame.writeUInt16LE(0x0401, o); o += 2;    // Command: batch read (0401)
-      frame.writeUInt16LE(0x0000, o); o += 2;    // Subcommand: word units (0000)
-      frame.writeUIntLE(devNum, o, 3); o += 3;   // Head device number (3 bytes)
-      frame.write("D\0", o, "ascii"); o += 2;    // Device code "D*" (ASCII, 2 bytes) for D register
-      frame.writeUInt16LE(count, o); o += 2;     // Number of device points to read
+      frame.writeUInt16LE(0x50, o); o += 2;
+      frame.writeUInt8(0x00, o); o += 1;
+      frame.writeUInt8(0xff, o); o += 1;
+      frame.writeUInt16LE(0x03ff, o); o += 2;
+      frame.writeUInt8(0x00, o); o += 1;
+      frame.writeUInt16LE(0x0c, o); o += 2;
+      frame.writeUInt16LE(0x0010, o); o += 2;
+      frame.writeUInt16LE(0x0401, o); o += 2;
+      frame.writeUInt16LE(0x0000, o); o += 2;
+      frame.writeUIntLE(devNum, o, 3); o += 3;
+      frame.write("D\0", o, "ascii"); o += 2;
+      frame.writeUInt16LE(count, o); o += 2;
 
       socket.write(frame);
     });
@@ -101,14 +158,13 @@ function mcRead3E({ host, port, headDevice = "D100", count = 6, timeout = 1500 }
     let received = Buffer.alloc(0);
     socket.on("data", (chunk) => {
       received = Buffer.concat([received, chunk]);
-      // Response header is 11 bytes, then 2 bytes per word
       if (received.length >= 11) {
         const dataLen = received.readUInt16LE(7);
         if (received.length >= 9 + dataLen) {
           finished = true;
           socket.destroy();
           const endCode = received.readUInt16LE(9);
-          if (endCode !== 0) {
+          if (endCode!== 0) {
             reject(new Error(`PLC returned error code 0x${endCode.toString(16)}`));
             return;
           }
@@ -124,13 +180,13 @@ function mcRead3E({ host, port, headDevice = "D100", count = 6, timeout = 1500 }
 }
 
 // ============================================================================
-//  LIVE DATA LOOP  (PLC read or simulation) — broadcast to all WS clients
+// LIVE DATA LOOP
 // ============================================================================
 let simBase = {};
 function simTick(n) {
   const out = {};
   for (let i = 1; i <= n; i++) {
-    const prev = simBase[i] ?? (820 + Math.random() * 85);
+    const prev = simBase[i]?? (820 + Math.random() * 85);
     let next = prev + (Math.random() * 7 - 3.5);
     next = Math.max(750, Math.min(970, next));
     simBase[i] = next;
@@ -151,12 +207,15 @@ function broadcast(type, payload) {
 }
 
 async function liveLoop() {
-  const s = db.settings;
+  const s = await getSettings();
   const n = s.furnace_count;
 
   if (s.simulation_mode) {
     lastTemps = simTick(n);
-    if (!plcOnline) { plcOnline = true; broadcast("plc_status", { connected: true, message: "SIMULATION MODE" }); }
+    if (!plcOnline) {
+      plcOnline = true;
+      broadcast("plc_status", { connected: true, message: "SIMULATION MODE" });
+    }
     broadcast("temps", lastTemps);
   } else {
     try {
@@ -164,37 +223,44 @@ async function liveLoop() {
       const temps = {};
       words.forEach((w, idx) => { temps[idx + 1] = Math.round((w / 10) * 10) / 10; });
       lastTemps = temps;
-      if (!plcOnline) { plcOnline = true; broadcast("plc_status", { connected: true, message: `PLC ONLINE ${s.plc_ip}:${s.plc_port}` }); }
+      if (!plcOnline) {
+        plcOnline = true;
+        broadcast("plc_status", { connected: true, message: `PLC ONLINE ${s.plc_ip}:${s.plc_port}` });
+      }
       broadcast("temps", lastTemps);
     } catch (e) {
-      if (plcOnline) { plcOnline = false; broadcast("plc_status", { connected: false, message: "PLC OFFLINE — " + e.message }); }
+      if (plcOnline) {
+        plcOnline = false;
+        broadcast("plc_status", { connected: false, message: "PLC OFFLINE — " + e.message });
+      }
     }
   }
 
   // alarm detection
-  const alarms = {};
   for (const [i, val] of Object.entries(lastTemps)) {
     let level = null;
     if (val >= s.crit_temp) level = "CRITICAL";
     else if (val >= s.warn_temp) level = "WARNING";
     if (level) {
-      alarms[i] = level;
-      const exists = db.alarm_log.find(a => a.furnace === `Furnace-${i}` && a.active);
-      if (!exists) {
-        db.alarm_log.unshift({
-          id: Date.now() + Math.random(),
-          ts: new Date().toLocaleString(),
-          furnace: `Furnace-${i}`,
+      const exists = await pool.query(
+        "SELECT * FROM alarm_log WHERE furnace = $1 AND active = true LIMIT 1",
+        [`Furnace-${i}`]
+      );
+      if (exists.rows.length === 0) {
+        const newAlarm = await pool.query(`
+          INSERT INTO alarm_log (ts, furnace, level, message, active)
+          VALUES ($1, $2, $3, $4, true)
+          RETURNING *
+        `, [
+          new Date().toLocaleString(),
+          `Furnace-${i}`,
           level,
-          message: `Furnace #${i} temperature ${level === "CRITICAL" ? "CRITICAL" : "high"}: ${val.toFixed(1)}°C`,
-          active: true,
-        });
-        if (db.alarm_log.length > 300) db.alarm_log.length = 300;
-        saveDB(db);
-        broadcast("alarm", db.alarm_log[0]);
+          `Furnace #${i} temperature ${level === "CRITICAL"? "CRITICAL" : "high"}: ${val.toFixed(1)}°C`
+        ]);
+        broadcast("alarm", newAlarm.rows[0]);
       }
     } else {
-      db.alarm_log.forEach(a => { if (a.furnace === `Furnace-${i}`) a.active = false; });
+      await pool.query("UPDATE alarm_log SET active = false WHERE furnace = $1", [`Furnace-${i}`]);
     }
   }
 
@@ -202,81 +268,136 @@ async function liveLoop() {
 }
 
 // ============================================================================
-//  EXPRESS APP + REST API
+// EXPRESS APP + REST API
 // ============================================================================
 const app = express();
 app.use(express.json());
 app.use(express.static(path.join(APP_DIR, "public")));
 
-app.post("/api/login", (req, res) => {
-  const { username, password } = req.body;
-  const user = db.users.find(u => u.username === username && u.password === sha256(password || ""));
-  if (!user) return res.status(401).json({ error: "Invalid username or password" });
-  res.json({ username: user.username, role: user.role, full_name: user.full_name });
+app.post("/api/login", async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    const result = await pool.query("SELECT * FROM users WHERE username = $1", [username]);
+    const user = result.rows[0];
+    if (!user || user.password!== sha256(password || "")) {
+      return res.status(401).json({ error: "Invalid username or password" });
+    }
+    res.json({ username: user.username, role: user.role, full_name: user.full_name });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
 });
 
-app.get("/api/settings", (req, res) => res.json(db.settings));
-
-app.post("/api/settings", (req, res) => {
-  Object.assign(db.settings, req.body);
-  db.settings.furnace_count = Math.max(4, Math.min(6, Number(db.settings.furnace_count) || 6));
-  simBase = {}; // reset sim base on settings change
-  saveDB(db);
-  res.json(db.settings);
+app.get("/api/settings", async (req, res) => {
+  const settings = await getSettings();
+  res.json(settings);
 });
 
-app.get("/api/production", (req, res) => {
-  let rows = [...db.production_log];
-  const { from, to, status, operator } = req.query;
-  if (from) rows = rows.filter(r => r.date >= from);
-  if (to) rows = rows.filter(r => r.date <= to);
-  if (status) rows = rows.filter(r => r.status === status);
-  if (operator) rows = rows.filter(r => r.operator === operator);
-  res.json(rows.slice().reverse());
+app.post("/api/settings", async (req, res) => {
+  try {
+    const newSettings = {...await getSettings(),...req.body };
+    newSettings.furnace_count = Math.max(4, Math.min(6, Number(newSettings.furnace_count) || 6));
+    await saveSettings(newSettings);
+    simBase = {};
+    res.json(newSettings);
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
 });
 
-app.post("/api/production", (req, res) => {
-  const rec = req.body;
-  rec.id = db.production_log.length + 1;
-  rec.date = new Date().toISOString().slice(0, 10);
-  rec.time = new Date().toLocaleTimeString();
-  rec.temps = Object.values(lastTemps);
-  db.production_log.push(rec);
-  saveDB(db);
-  res.json(rec);
+app.get("/api/production", async (req, res) => {
+  try {
+    let query = "SELECT * FROM production_log WHERE 1=1";
+    const params = [];
+    const { from, to, status, operator } = req.query;
+
+    if (from) {
+      params.push(from);
+      query += ` AND date >= $${params.length}`;
+    }
+    if (to) {
+      params.push(to);
+      query += ` AND date <= $${params.length}`;
+    }
+    if (status) {
+      params.push(status);
+      query += ` AND status = $${params.length}`;
+    }
+    if (operator) {
+      params.push(operator);
+      query += ` AND operator = $${params.length}`;
+    }
+
+    query += " ORDER BY id DESC";
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
 });
 
-app.get("/api/alarms", (req, res) => res.json(db.alarm_log.slice(0, 100)));
+app.post("/api/production", async (req, res) => {
+  try {
+    const rec = req.body;
+    const result = await pool.query(`
+      INSERT INTO production_log (date, time, temps, operator, machine, part, shift, target, qty, remarks, status)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+      RETURNING *
+    `, [
+      new Date().toISOString().slice(0, 10),
+      new Date().toLocaleTimeString(),
+      JSON.stringify(Object.values(lastTemps)),
+      rec.operator,
+      rec.machine,
+      rec.part,
+      rec.shift,
+      rec.target,
+      rec.qty,
+      rec.remarks,
+      rec.status
+    ]);
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
 
-app.post("/api/alarms/ack", (req, res) => {
-  db.alarm_log.forEach(a => (a.active = false));
-  saveDB(db);
+app.get("/api/alarms", async (req, res) => {
+  const result = await pool.query("SELECT * FROM alarm_log ORDER BY id DESC LIMIT 100");
+  res.json(result.rows);
+});
+
+app.post("/api/alarms/ack", async (req, res) => {
+  await pool.query("UPDATE alarm_log SET active = false");
   res.json({ ok: true });
 });
 
-app.get("/api/operators", (req, res) => {
-  const ops = [...new Set(db.production_log.map(r => r.operator).filter(Boolean))];
-  res.json(ops);
+app.get("/api/operators", async (req, res) => {
+  const result = await pool.query("SELECT DISTINCT operator FROM production_log WHERE operator IS NOT NULL");
+  res.json(result.rows.map(r => r.operator));
 });
 
 // ============================================================================
-//  HTTP + WEBSOCKET SERVER
+// HTTP + WEBSOCKET SERVER
 // ============================================================================
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws" });
 
 wss.on("connection", (ws) => {
   wsClients.add(ws);
-  ws.send(JSON.stringify({ type: "plc_status", payload: { connected: plcOnline, message: plcOnline ? "CONNECTED" : "CONNECTING…" } }));
+  ws.send(JSON.stringify({ type: "plc_status", payload: { connected: plcOnline, message: plcOnline? "CONNECTED" : "CONNECTING…" } }));
   ws.on("close", () => wsClients.delete(ws));
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
+
+server.listen(PORT, async () => {
+  await initDB();
+  const settings = await getSettings();
   console.log(`\n==============================================`);
   console.log(` TOYO SPRINGS LTD — Furnace MES running`);
   console.log(` Open: http://localhost:${PORT}`);
-  console.log(` Mode: ${db.settings.simulation_mode ? "SIMULATION" : "LIVE PLC " + db.settings.plc_ip + ":" + db.settings.plc_port}`);
+ 
   console.log(`==============================================\n`);
   liveLoop();
 });
