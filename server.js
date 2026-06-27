@@ -9,7 +9,7 @@ const net = require("net");
 const crypto = require("crypto");
 const path = require("path");
 const { WebSocketServer } = require("ws");
-const pool = require("./db");
+
 require("dotenv").config();
 
 const APP_DIR = __dirname;
