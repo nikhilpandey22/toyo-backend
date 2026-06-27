@@ -292,7 +292,15 @@ app.get("/api/settings", async (req, res) => {
   const settings = await getSettings();
   res.json(settings);
 });
-
+app.get('/api/data', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM temperatures ORDER BY id DESC LIMIT 100');
+    res.json({ data: result.rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
 app.post("/api/settings", async (req, res) => {
   try {
     const newSettings = {...await getSettings(),...req.body };
