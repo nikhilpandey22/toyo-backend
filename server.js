@@ -292,15 +292,25 @@ app.get("/api/settings", async (req, res) => {
   const settings = await getSettings();
   res.json(settings);
 });
+
+// ===== CHECK TABLE COUNTS - UPDATED =====
 app.get('/api/data', async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM production_log ORDER BY id DESC LIMIT 100');
-    res.json({ data: result.rows });
+    const tables = ['users', 'settings', 'production_log', 'alarm_log'];
+    const result = {};
+
+    for (const table of tables) {
+      const count = await pool.query(`SELECT COUNT(*) FROM ${table}`);
+      result[table] = parseInt(count.rows[0].count);
+    }
+
+    res.json({ table_counts: result });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Database error' });
+    res.status(500).json({ error: err.message });
   }
 });
+
 app.post("/api/settings", async (req, res) => {
   try {
     const newSettings = {...await getSettings(),...req.body };
@@ -385,6 +395,20 @@ app.get("/api/operators", async (req, res) => {
   res.json(result.rows.map(r => r.operator));
 });
 
+// ===== CHECK SABHI TABLES =====
+app.get('/api/tables', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT table_name
+      FROM information_schema.tables
+      WHERE table_schema = 'public'
+    `);
+    res.json({ tables: result.rows });
+  } catch (err) {
+    res.json({ error: err.message });
+  }
+});
+
 // ============================================================================
 // HTTP + WEBSOCKET SERVER
 // ============================================================================
@@ -396,20 +420,7 @@ wss.on("connection", (ws) => {
   ws.send(JSON.stringify({ type: "plc_status", payload: { connected: plcOnline, message: plcOnline? "CONNECTED" : "CONNECTING…" } }));
   ws.on("close", () => wsClients.delete(ws));
 });
-// ===== CHECK SABHI TABLES =====
-app.get('/api/tables', async (req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT table_name 
-      FROM information_schema.tables 
-      WHERE table_schema = 'public'
-    `);
-    res.json({ tables: result.rows });
-  } catch (err) {
-    res.json({ error: err.message });
-  }
-});
-// ==============================
+
 const PORT = process.env.PORT || 3000;
 
 server.listen(PORT, async () => {
@@ -418,7 +429,6 @@ server.listen(PORT, async () => {
   console.log(`\n==============================================`);
   console.log(` TOYO SPRINGS LTD — Furnace MES running`);
   console.log(` Open: http://localhost:${PORT}`);
- 
   console.log(`==============================================\n`);
   liveLoop();
 });
