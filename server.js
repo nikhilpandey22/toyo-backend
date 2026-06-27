@@ -10,7 +10,7 @@ const crypto = require("crypto");
 const path = require("path");
 const { WebSocketServer } = require("ws");
 
-require("dotenv").config();
+// require("dotenv").config();
 
 const APP_DIR = __dirname;
 
@@ -388,16 +388,20 @@ wss.on("connection", (ws) => {
   ws.send(JSON.stringify({ type: "plc_status", payload: { connected: plcOnline, message: plcOnline? "CONNECTED" : "CONNECTING…" } }));
   ws.on("close", () => wsClients.delete(ws));
 });
-// ===== DATABASE DATA DEKHNE KE LIYE =====
-app.get('/api/data', async (req, res) => {
+// ===== CHECK SABHI TABLES =====
+app.get('/api/tables', async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM furnace_cycles ORDER BY id DESC LIMIT 50');
-    res.json({ total: result.rowCount, data: result.rows });
+    const result = await pool.query(`
+      SELECT table_name 
+      FROM information_schema.tables 
+      WHERE table_schema = 'public'
+    `);
+    res.json({ tables: result.rows });
   } catch (err) {
     res.json({ error: err.message });
   }
 });
-// =======================================
+// ==============================
 const PORT = process.env.PORT || 3000;
 
 server.listen(PORT, async () => {
