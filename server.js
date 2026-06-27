@@ -11,8 +11,8 @@ const path = require("path");
 const { WebSocketServer } = require("ws");
 // TEMP: Delete temperatures table on startup
 pool.query('DROP TABLE IF EXISTS temperatures')
-  .then(() => console.log('temperatures table deleted ✅'))
-  .catch(err => console.log('Delete error:', err));
+ .then(() => console.log('temperatures table deleted ✅'))
+ .catch(err => console.log('Delete error:', err));
 // require("dotenv").config();
 
 const APP_DIR = __dirname;
@@ -308,6 +308,26 @@ app.get('/api/data', async (req, res) => {
     }
 
     res.json({ table_counts: result });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ===== DATA RANGE API - 2 MAHINE KA DATA NIKALNE KE LIYE =====
+app.get('/api/data-range', async (req, res) => {
+  try {
+    const { from, to } = req.query; //?from=2026-05-01&to=2026-06-27
+
+    let query = `SELECT * FROM production_log`;
+    if (from && to) {
+      query += ` WHERE date BETWEEN '${from}' AND '${to}'`;
+    }
+    query += ` ORDER BY date DESC, time DESC LIMIT 5000`;
+
+    const result = await pool.query(query);
+    res.json(result.rows);
+
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });
