@@ -388,7 +388,16 @@ wss.on("connection", (ws) => {
   ws.send(JSON.stringify({ type: "plc_status", payload: { connected: plcOnline, message: plcOnline? "CONNECTED" : "CONNECTING…" } }));
   ws.on("close", () => wsClients.delete(ws));
 });
-
+// ===== DATABASE DATA DEKHNE KE LIYE =====
+app.get('/api/data', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM furnace_cycles ORDER BY id DESC LIMIT 50');
+    res.json({ total: result.rowCount, data: result.rows });
+  } catch (err) {
+    res.json({ error: err.message });
+  }
+});
+// =======================================
 const PORT = process.env.PORT || 3000;
 
 server.listen(PORT, async () => {
