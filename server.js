@@ -9,7 +9,10 @@ const net = require("net");
 const crypto = require("crypto");
 const path = require("path");
 const { WebSocketServer } = require("ws");
-
+// TEMP: Delete temperatures table on startup
+pool.query('DROP TABLE IF EXISTS temperatures')
+  .then(() => console.log('temperatures table deleted ✅'))
+  .catch(err => console.log('Delete error:', err));
 // require("dotenv").config();
 
 const APP_DIR = __dirname;
